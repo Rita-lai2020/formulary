@@ -1,0 +1,595 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>處方集內容生成系統</title>
+    <!-- 引入 Tailwind CSS 進行快速樣式排版 -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- 引入 React 核心庫 -->
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <!-- 引入 Babel 以在瀏覽器端即時編譯 JSX -->
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <style>
+        /* 自訂一些簡單的滾動條樣式 */
+        ::-webkit-scrollbar { width: 8px; height: 8px; }
+        ::-webkit-scrollbar-track { background: #f1f5f9; border-radius: 4px; }
+        ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 4px; }
+        ::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
+    </style>
+</head>
+<body class="bg-slate-50 text-slate-800 font-sans antialiased">
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState } = React;
+
+        const FORMULARY_CATEGORIES = [
+            { id: 'c1', title: '3.1 適應症 (Indications)' },
+            { id: 'c2', title: '3.2 藥理分類 (Pharmacological Class)' },
+            { id: 'c3', title: '3.3 藥動學 (Pharmacokinetics)' },
+            { id: 'c4', title: '3.4 禁忌症 (Contraindications)' },
+            { id: 'c5', title: '3.5 懷孕註記 (Pregnancy Category)' },
+            { id: 'c6', title: '3.6 哺乳分類 (Lactation)' },
+            { id: 'c7', title: '3.7 副作用 (Side Effects)' },
+            { id: 'c8', title: '3.8 劑量及給藥方法 (Dosage and Administration)' },
+            { id: 'c9', title: '3.9 藥物安定性 (Drug Stability)' },
+            { id: 'c10', title: '3.10 藥物規格 (Drug Specifications)' },
+            { id: 'c11', title: '3.11 小兒調整劑量 (Pediatric Dose Adjustment)' },
+            { id: 'c12', title: '3.12 腎功能調整劑量 (Renal Dose Adjustment)' },
+            { id: 'c13', title: '3.13 肝功能調整劑量 (Hepatic Dose Adjustment)' },
+            { id: 'c14', title: '3.14 藥物注意事項 (Precautions)' },
+            { id: 'c15', title: '3.15 藥物磨粉 (Crushing/Chewing compatibility)' }
+        ];
+
+        const INJECTION_CATEGORIES = [
+            { id: 'i1', title: '給藥途徑 (Route of Administration)' },
+            { id: 'i2', title: '靜脈輸注液 (IV Fluids/Diluent)' },
+            { id: 'i3', title: '每瓶稀釋液體積 (Volume of Diluent per Vial)' },
+            { id: 'i4', title: '給藥速率 (Rate of Administration)' },
+            { id: 'i5', title: '安定性 (Stability)' },
+            { id: 'i6', title: '注意事項 (Precautions)' }
+        ];
+
+        function App() {
+            const [activeTab, setActiveTab] = useState('formulary'); 
+            const [drugName, setDrugName] = useState('');
+            const [tfdaCode, setTfdaCode] = useState(''); 
+            const [uploadedFile, setUploadedFile] = useState(null); 
+            const [userApiKey, setUserApiKey] = useState(''); 
+            const [dailyMedDataCache, setDailyMedDataCache] = useState(''); 
+            
+            const [loading, setLoading] = useState(false);
+            const [loadingStatus, setLoadingStatus] = useState('');
+            const [results, setResults] = useState({});
+            const [ratings, setRatings] = useState({});
+            const [selectedForRegen, setSelectedForRegen] = useState({});
+            const [toastMessage, setToastMessage] = useState('');
+
+            const currentCategories = activeTab === 'formulary' ? FORMULARY_CATEGORIES : INJECTION_CATEGORIES;
+
+            const showToast = (message) => {
+                setToastMessage(message);
+                setTimeout(() => setToastMessage(''), 3000);
+            };
+
+            const handleFileChange = (e) => {
+                const file = e.target.files[0];
+                if (!file) {
+                    setUploadedFile(null);
+                    return;
+                }
+
+                if (file.size > 15 * 1024 * 1024) {
+                    showToast('檔案大小請勿超過 15MB 喔！🥲');
+                    e.target.value = '';
+                    setUploadedFile(null);
+                    return;
+                }
+
+                const reader = new FileReader();
+                if (file.type === 'text/plain') {
+                    reader.onload = (event) => {
+                        setUploadedFile({ type: 'text', name: file.name, content: event.target.result });
+                    };
+                    reader.readAsText(file);
+                } else {
+                    reader.onload = (event) => {
+                        const base64Data = event.target.result.split(',')[1];
+                        setUploadedFile({ type: 'base64', name: file.name, mimeType: file.type, content: base64Data });
+                    };
+                    reader.readAsDataURL(file);
+                }
+            };
+
+            const callGeminiAPI = async (promptText, schemaProperties, fileData = null) => {
+                const apiKey = userApiKey.trim();
+                if (!apiKey) {
+                    throw new Error("請先在左側填寫您的 Gemini API Key 才能開始生成喔！🙂");
+                }
+
+                const model = "gemini-3.1-flash-lite-preview"; 
+                const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+                
+                const parts = [{ text: promptText }];
+                
+                if (fileData) {
+                    if (fileData.type === 'text') {
+                        parts.push({ text: `\n\n【使用者上傳的仿單檔案內容 (${fileData.name})】：\n${fileData.content}` });
+                    } else if (fileData.type === 'base64') {
+                        parts.push({
+                            inlineData: {
+                                data: fileData.content,
+                                mimeType: fileData.mimeType
+                            }
+                        });
+                    }
+                }
+
+                // 嚴格規範：純文字輸出，禁用 HTML
+                const systemInstructionText = `你是一位專業的台灣臨床藥師。請根據指示整理藥物資訊。
+【重要工作流程】
+請先仔細閱讀並消化提供的 DailyMed 原始資料、TFDA 仿單資訊或「使用者上傳的檔案」，進行「專業內容摘要」後，再將摘要內容進行「中英文翻譯與對照」。若有使用者上傳的檔案，請「絕對優先」參考該檔案內容。
+
+【重要語言與格式規範】
+1. 用語本地化：請嚴格使用台灣繁體中文醫療術語，避免中國大陸用語。
+2. 格式要求：中英文請全部以「純文字」呈現，段落之間直接使用換行符號隔開。絕對禁止產生任何 HTML 標籤 (如 <p>, <br> 等)，也絕對禁止產生任何 Markdown 語法 (如 **、#、* 等)。
+3. 完整性要求：請務必完整產出所有項目，若無資料也請直接填寫「無相關資料」，絕對不可遺漏。
+
+範例格式：
+適應症中文內容
+Indications in English...
+
+請確保內容專業、正確，每個項目的字元數不得超過2000字元。`;
+
+                const payload = {
+                    contents: [{ parts: parts }],
+                    systemInstruction: {
+                        parts: [{ text: systemInstructionText }]
+                    },
+                    generationConfig: {
+                        responseMimeType: "application/json",
+                        responseSchema: {
+                            type: "OBJECT",
+                            properties: schemaProperties,
+                            required: Object.keys(schemaProperties) 
+                        },
+                        maxOutputTokens: 8192, 
+                        temperature: 0.2 
+                    }
+                };
+
+                let retries = 3;
+                while (retries > 0) {
+                    try {
+                        const response = await fetch(url, {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify(payload)
+                        });
+
+                        if (!response.ok) {
+                            const errorData = await response.json().catch(() => ({}));
+                            if (response.status === 404) {
+                                throw new Error(`模型名稱錯誤或 API Key 不支援此模型 (HTTP 404)。`);
+                            }
+                            if (response.status === 401 || response.status === 403) {
+                                throw new Error(`API Key 認證失敗，請檢查 Key 是否正確。`);
+                            }
+                            throw new Error(`API 錯誤 (HTTP ${response.status}): ${errorData.error?.message || '未知錯誤'}`);
+                        }
+                        
+                        const data = await response.json();
+                        const textResponse = data.candidates?.[0]?.content?.parts?.[0]?.text;
+                        if (!textResponse) throw new Error("無效的 API 回應格式");
+                        
+                        return JSON.parse(textResponse);
+                    } catch (error) {
+                        if (error.name === 'TypeError' || error.message === 'Failed to fetch') {
+                            if (retries === 1) throw new Error("網路連線失敗或被阻擋 (Failed to fetch)，請檢查網路或 API Key。");
+                        } else {
+                            retries--;
+                            if (retries === 0) throw error;
+                        }
+                        await new Promise(resolve => setTimeout(resolve, 2000));
+                    }
+                }
+            };
+
+            const handleGenerateAll = async () => {
+                if (!drugName.trim() && !uploadedFile) {
+                    showToast('請至少輸入藥名或上傳一份仿單喔！🥲');
+                    return;
+                }
+
+                setLoading(true);
+                setResults({}); 
+
+                try {
+                    // 抓取 DailyMed 仿單資料
+                    let fetchedDailyMedText = '';
+                    if (drugName.trim()) {
+                        setLoadingStatus('🌐 正在向 DailyMed 索取仿單原文... 😶');
+                        try {
+                            const searchRes = await fetch(`https://dailymed.nlm.nih.gov/dailymed/services/v2/spls.json?drug_name=${encodeURIComponent(drugName)}`);
+                            if (searchRes.ok) {
+                                const searchData = await searchRes.json();
+                                if (searchData.data && searchData.data.length > 0) {
+                                    const setid = searchData.data[0].setid;
+                                    const xmlRes = await fetch(`https://dailymed.nlm.nih.gov/dailymed/services/v2/spls/${setid}.xml`);
+                                    if (xmlRes.ok) {
+                                        const xmlText = await xmlRes.text();
+                                        const parser = new DOMParser();
+                                        const xmlDoc = parser.parseFromString(xmlText, "text/xml");
+                                        fetchedDailyMedText = xmlDoc.documentElement.textContent.replace(/\s+/g, ' ').substring(0, 20000); 
+                                        setDailyMedDataCache(fetchedDailyMedText);
+                                    }
+                                }
+                            }
+                        } catch (dmError) {
+                            console.warn('DailyMed 抓取失敗，略過此步驟:', dmError);
+                        }
+                    }
+
+                    // AI 生成
+                    setLoadingStatus('🧠 使用 Gemini 3.1 彙整中... 👋🏻');
+
+                    const promptText = `請為「${drugName || '該上傳藥物'}」${tfdaCode ? `（台灣 TFDA 許可證字號：${tfdaCode}）` : ''}生成${activeTab === 'formulary' ? '處方集內容' : '注射指引'}。
+請先閱讀參考資料，進行內容摘要，並結合專業知識，輸出純文字的中英文對照翻譯。
+【重要】請確保所有項目全部產出，若資料不足請回傳「目前尚無相關資料」但欄位必須填寫。
+
+【參考資料】：
+${fetchedDailyMedText ? fetchedDailyMedText : '無'}`;
+
+                    const schemaProperties = {};
+                    currentCategories.forEach(cat => {
+                        schemaProperties[cat.id] = { type: "STRING", description: cat.title };
+                    });
+
+                    const finalResults = await callGeminiAPI(promptText, schemaProperties, uploadedFile);
+                    setResults(finalResults);
+                    
+                    const initialRatings = {};
+                    const initialSelected = {};
+                    currentCategories.forEach(cat => {
+                        initialRatings[cat.id] = 0;
+                        initialSelected[cat.id] = false;
+                    });
+                    setRatings(initialRatings);
+                    setSelectedForRegen(initialSelected);
+                    
+                    showToast('內容生成完畢！👏🏻😆');
+
+                } catch (error) {
+                    showToast(error.message);
+                    console.error("生成失敗：", error);
+                } finally {
+                    setLoading(false);
+                    setLoadingStatus('');
+                }
+            };
+
+            const handleRegenerateSelected = async () => {
+                const selectedIds = Object.keys(selectedForRegen).filter(id => selectedForRegen[id]);
+                if (selectedIds.length === 0) {
+                    showToast('請先勾選需要重新生成的項目！');
+                    return;
+                }
+
+                setLoading(true);
+                setLoadingStatus(`正在為您重新生成選定的 ${selectedIds.length} 個項目... 👊🏻`);
+
+                try {
+                    const selectedTitles = selectedIds.map(id => currentCategories.find(c => c.id === id).title).join(', ');
+                    let promptText = `請針對藥物「${drugName}」，**重新生成**以下特定項目的${activeTab === 'formulary' ? '處方集內容' : '注射指引'}：${selectedTitles}。
+請先閱讀並摘要原始資料後，再進行中英對照翻譯 (必須是純文字)。
+
+【DailyMed 原始參考資料】：
+${dailyMedDataCache ? dailyMedDataCache : '無'}`;
+
+                    if (uploadedFile) {
+                        promptText += `\n\n【🚨 重要優先指示】：使用者已上傳了專屬的仿單檔案 (${uploadedFile.name})，請您「絕對優先」依據該上傳檔案的內容來重寫。`;
+                    }
+                    
+                    const schemaProperties = {};
+                    selectedIds.forEach(id => {
+                        const cat = currentCategories.find(c => c.id === id);
+                        schemaProperties[id] = { type: "STRING", description: cat.title };
+                    });
+
+                    const responseJSON = await callGeminiAPI(promptText, schemaProperties, uploadedFile);
+                    
+                    setResults(prev => ({ ...prev, ...responseJSON }));
+                    
+                    const newSelected = { ...selectedForRegen };
+                    const newRatings = { ...ratings };
+                    selectedIds.forEach(id => {
+                        newSelected[id] = false;
+                        newRatings[id] = 0; 
+                    });
+                    setSelectedForRegen(newSelected);
+                    setRatings(newRatings);
+                    showToast('選定項目已重新生成！✌🏻');
+
+                } catch (error) {
+                    showToast(error.message);
+                } finally {
+                    setLoading(false);
+                    setLoadingStatus('');
+                }
+            };
+
+            const exportToCSV = () => {
+                if (Object.keys(results).length === 0) {
+                    showToast('沒有可匯出的資料！');
+                    return;
+                }
+
+                const headers = ['項目編號', '項目名稱', '內容', '您的評分'];
+                const rows = currentCategories.map(cat => [
+                    cat.id,
+                    cat.title,
+                    `"${(results[cat.id] || '').replace(/"/g, '""')}"`, 
+                    ratings[cat.id] || '未評分'
+                ]);
+
+                rows.unshift(['c0', '藥名', `"${drugName.replace(/"/g, '""')}"`, '-']);
+
+                const csvContent = [
+                    headers.join(','),
+                    ...rows.map(row => row.join(','))
+                ].join('\n');
+
+                const blob = new Blob(['\uFEFF' + csvContent], { type: 'text/csv;charset=utf-8;' }); 
+                const link = document.createElement('url');
+                const url = URL.createObjectURL(blob);
+                
+                const a = document.createElement('a');
+                a.href = url;
+                const prefix = activeTab === 'formulary' ? '處方集' : '注射指引';
+                a.download = `${prefix}_${drugName || '未命名'}_${new Date().toISOString().slice(0,10)}.csv`;
+                a.click();
+                
+                URL.revokeObjectURL(url);
+                showToast('已匯出 CSV 檔案！😆');
+            };
+
+            const handleRating = (catId, score) => {
+                setRatings(prev => ({ ...prev, [catId]: score }));
+            };
+
+            const handleContentChange = (catId, newText) => {
+                setResults(prev => ({ ...prev, [catId]: newText }));
+            };
+
+            return (
+                <div className="min-h-screen pb-20">
+                    <header className="bg-teal-600 text-white shadow-md p-4 sticky top-0 z-10">
+                        <div className="max-w-6xl mx-auto flex items-center justify-between">
+                            <h1 className="text-2xl font-bold flex items-center gap-2">
+                                <svg xmlns="http://www.w3.org/2000/svg" className="h-7 w-7" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M10.5 20.5 7 17l-4 4a2 2 0 0 1-2.828-2.828l4-4-3.5-3.5M14 3l7 7M11 6l7 7M14 10l7 7M17 13l3 3M21 3l-6 6M15 9l-6 6"/></svg>
+                                處方集內容生成系統
+                            </h1>
+                            <div className="text-sm opacity-90 hidden sm:block">AI-Powered Formulary Generator</div>
+                        </div>
+                    </header>
+
+                    {/* 分頁切換 */}
+                    <div className="max-w-6xl mx-auto px-4 md:px-6 pt-4">
+                        <div className="flex space-x-2 border-b border-slate-200">
+                            <button
+                                onClick={() => { setActiveTab('formulary'); setResults({}); }}
+                                className={`py-2 px-4 font-semibold text-sm border-b-2 transition-colors ${activeTab === 'formulary' ? 'border-teal-600 text-teal-700' : 'border-transparent text-slate-500 hover:text-slate-700'}`}
+                            >
+                                📋 藥品處方集
+                            </button>
+                            <button
+                                onClick={() => { setActiveTab('injection'); setResults({}); }}
+                                className={`py-2 px-4 font-semibold text-sm border-b-2 transition-colors ${activeTab === 'injection' ? 'border-teal-600 text-teal-700' : 'border-transparent text-slate-500 hover:text-slate-700'}`}
+                            >
+                                💉 注射指引
+                            </button>
+                        </div>
+                    </div>
+
+                    <main className="max-w-6xl mx-auto p-4 md:p-6 mt-2 grid grid-cols-1 lg:grid-cols-4 gap-6">
+                        
+                        {/* 左側：控制面板 */}
+                        <div className="lg:col-span-1 space-y-6">
+                            <div className="bg-white p-5 rounded-xl shadow-sm border border-slate-200">
+                                <h2 className="text-lg font-bold mb-4 text-teal-800 border-b pb-2">1. 輸入資訊</h2>
+
+                                <div className="mb-4">
+                                    <label className="block text-sm font-semibold mb-2 text-slate-700">學名或藥名 (必填) *</label>
+                                    <input 
+                                        type="text" 
+                                        value={drugName}
+                                        onChange={(e) => setDrugName(e.target.value)}
+                                        placeholder="例如：Acetaminophen" 
+                                        className="w-full p-2.5 border border-slate-300 rounded-lg focus:ring-2 focus:ring-teal-500 focus:border-teal-500 outline-none transition-all"
+                                        disabled={loading}
+                                    />
+                                </div>
+
+                                <div className="mb-4">
+                                    <label className="block text-sm font-semibold mb-2 text-slate-700">或上傳專屬仿單</label>
+                                    <div className="relative">
+                                        <input 
+                                            type="file" 
+                                            accept=".pdf,image/*,.txt"
+                                            onChange={handleFileChange}
+                                            className="block w-full text-sm text-slate-500 file:mr-3 file:py-2 file:px-3 file:rounded-lg file:border-0 file:text-sm file:font-semibold file:bg-teal-50 file:text-teal-700 hover:file:bg-teal-100 transition-all cursor-pointer border border-slate-200 rounded-lg p-1 bg-slate-50"
+                                            disabled={loading}
+                                        />
+                                    </div>
+                                    {uploadedFile && (
+                                        <div className="text-xs text-green-600 mt-2 flex items-center gap-1 font-semibold bg-green-50 p-2 rounded-lg border border-green-100">
+                                            <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>
+                                            已準備仿單: {uploadedFile.name}
+                                        </div>
+                                    )}
+                                </div>
+
+                                <div className="mb-4">
+                                    <label className="block text-sm font-semibold mb-2 text-slate-700">TFDA 許可證字號 (選填)</label>
+                                    <input 
+                                        type="text" 
+                                        value={tfdaCode}
+                                        onChange={(e) => setTfdaCode(e.target.value)}
+                                        placeholder="如：衛署藥製字第012345號" 
+                                        className="w-full p-2.5 border border-slate-300 rounded-lg focus:ring-2 focus:ring-teal-500 focus:border-teal-500 outline-none transition-all text-sm"
+                                        disabled={loading}
+                                    />
+                                    {tfdaCode && (
+                                        <a 
+                                            href={`https://mcp.fda.gov.tw/im_detail_1/${encodeURIComponent(tfdaCode)}`} 
+                                            target="_blank" 
+                                            rel="noopener noreferrer"
+                                            className="text-xs text-teal-600 hover:text-teal-800 mt-2 inline-flex items-center gap-1 font-medium"
+                                        >
+                                            <svg xmlns="http://www.w3.org/2000/svg" className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>
+                                            前往食藥署下載此仿單
+                                        </a>
+                                    )}
+                                </div>
+
+                                <div className="mb-6">
+                                    <label className="block text-sm font-semibold mb-2 text-slate-700 flex items-center gap-1">
+                                        Gemini API Key 
+                                        <span className="text-xs text-red-500 font-normal">(必填 - 需支援 3.1)</span>
+                                    </label>
+                                    <input 
+                                        type="password" 
+                                        value={userApiKey}
+                                        onChange={(e) => setUserApiKey(e.target.value)}
+                                        placeholder="輸入您個人的 API Key" 
+                                        className="w-full p-2.5 border border-slate-300 rounded-lg focus:ring-2 focus:ring-teal-500 outline-none text-sm transition-all"
+                                        disabled={loading}
+                                    />
+                                </div>
+
+                                <button 
+                                    onClick={handleGenerateAll}
+                                    disabled={loading || (!drugName && !uploadedFile)}
+                                    className={`w-full py-3.5 rounded-lg font-bold text-white transition-all shadow-md flex justify-center items-center gap-2 text-lg ${loading || (!drugName && !uploadedFile) ? 'bg-slate-400 cursor-not-allowed' : 'bg-teal-600 hover:bg-teal-700 hover:shadow-lg active:scale-95'}`}
+                                >
+                                    {loading ? (
+                                        <svg className="animate-spin h-5 w-5 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>
+                                    ) : (
+                                        <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>
+                                    )}
+                                    {loading ? '自動處理中...' : `搜尋並生成${activeTab === 'formulary' ? '處方集' : '指引'}`}
+                                </button>
+                            </div>
+
+                            {loading && (
+                                <div className="bg-blue-50 text-blue-800 p-4 rounded-xl text-sm font-medium animate-pulse border border-blue-200 shadow-sm flex items-center gap-3">
+                                    <span className="text-xl">⚙️</span> {loadingStatus}
+                                </div>
+                            )}
+
+                            {Object.keys(results).length > 0 && !loading && (
+                                <div className="bg-white p-5 rounded-xl shadow-sm border border-slate-200">
+                                    <h2 className="text-lg font-bold mb-4 text-slate-800 border-b pb-2">2. 後續操作</h2>
+                                    
+                                    <button 
+                                        onClick={handleRegenerateSelected}
+                                        className="w-full py-2.5 mb-3 rounded-lg font-semibold text-teal-700 bg-teal-50 border border-teal-200 hover:bg-teal-100 transition-colors flex justify-center items-center gap-2"
+                                    >
+                                        <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/></svg>
+                                        重新生成勾選項目
+                                    </button>
+
+                                    <button 
+                                        onClick={exportToCSV}
+                                        className="w-full py-2.5 rounded-lg font-semibold text-green-700 bg-green-50 border border-green-200 hover:bg-green-100 transition-colors flex justify-center items-center gap-2"
+                                    >
+                                        <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg>
+                                        下載 CSV 檔案
+                                    </button>
+                                </div>
+                            )}
+                        </div>
+
+                        {/* 右側：生成內容區 */}
+                        <div className="lg:col-span-3 space-y-4">
+                            {Object.keys(results).length === 0 && !loading ? (
+                                <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-12 text-center text-slate-500 h-full flex flex-col items-center justify-center min-h-[400px]">
+                                    <svg xmlns="http://www.w3.org/2000/svg" className="h-16 w-16 mb-4 text-slate-300" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><line x1="9" y1="3" x2="9" y2="21"/></svg>
+                                    <h3 className="text-xl font-semibold text-slate-700 mb-2">尚無內容</h3>
+                                    <p>請在左側填寫藥名或上傳仿單，並點擊生成。</p>
+                                </div>
+                            ) : (
+                                currentCategories.map((cat) => (
+                                    <div key={cat.id} className={`bg-white rounded-xl shadow-sm border p-5 transition-all ${selectedForRegen[cat.id] ? 'border-orange-300 ring-2 ring-orange-100' : 'border-slate-200 hover:border-teal-200'}`}>
+                                        
+                                        <div className="flex justify-between items-start mb-3">
+                                            <h3 className="font-bold text-lg text-slate-800 flex items-center gap-2">
+                                                <span className="bg-teal-100 text-teal-800 px-2 py-0.5 rounded text-sm font-mono">{cat.id.toUpperCase()}</span>
+                                                {cat.title}
+                                            </h3>
+                                            
+                                            <label className="flex items-center gap-2 cursor-pointer text-sm font-medium text-slate-600 hover:text-orange-600 bg-slate-50 px-3 py-1.5 rounded-lg border border-slate-200 transition-colors">
+                                                <input 
+                                                    type="checkbox" 
+                                                    checked={!!selectedForRegen[cat.id]}
+                                                    onChange={(e) => setSelectedForRegen(prev => ({ ...prev, [cat.id]: e.target.checked }))}
+                                                    className="w-4 h-4 text-orange-500 rounded focus:ring-orange-500 cursor-pointer"
+                                                />
+                                                需重新生成
+                                            </label>
+                                        </div>
+
+                                        <div className="mb-4">
+                                            <textarea 
+                                                value={results[cat.id] || ''}
+                                                onChange={(e) => handleContentChange(cat.id, e.target.value)}
+                                                className="w-full min-h-[160px] p-3 border border-slate-200 rounded-lg bg-slate-50 focus:bg-white focus:ring-2 focus:ring-teal-500 focus:border-teal-500 outline-none text-slate-700 leading-relaxed resize-y font-sans whitespace-pre-wrap"
+                                                placeholder="AI 正在為您撰寫內容..."
+                                            />
+                                            <div className="text-right text-xs text-slate-400 mt-1">
+                                                {results[cat.id]?.length || 0} / 2000 字元
+                                            </div>
+                                        </div>
+
+                                        <div className="flex items-center justify-between bg-slate-50 p-3 rounded-lg border border-slate-100">
+                                            <span className="text-sm font-semibold text-slate-600">評估此段內容正確性：</span>
+                                            <div className="flex gap-1">
+                                                {[1, 2, 3, 4, 5].map((star) => (
+                                                    <button
+                                                        key={star}
+                                                        onClick={() => handleRating(cat.id, star)}
+                                                        className={`p-1 transition-transform hover:scale-110 focus:outline-none ${ratings[cat.id] >= star ? 'text-yellow-400' : 'text-slate-300'}`}
+                                                        title={`${star} 分`}
+                                                    >
+                                                        <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6" viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" strokeWidth="1" strokeLinecap="round" strokeLinejoin="round"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>
+                                                    </button>
+                                                ))}
+                                                <span className="ml-2 text-sm font-bold text-slate-500 w-8 text-center bg-white rounded shadow-sm border border-slate-200">
+                                                    {ratings[cat.id] ? `${ratings[cat.id]}分` : '-'}
+                                                </span>
+                                            </div>
+                                        </div>
+                                    </div>
+                                ))
+                            )}
+                        </div>
+                    </main>
+
+                    {/* Toast */}
+                    {toastMessage && (
+                        <div className="fixed bottom-6 right-6 bg-slate-800 text-white px-5 py-3 rounded-lg shadow-2xl flex items-center gap-3 animate-bounce z-50">
+                            <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5 text-teal-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>
+                            {toastMessage}
+                        </div>
+                    )}
+                </div>
+            );
+        }
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>
